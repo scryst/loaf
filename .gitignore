@@ -1,0 +1,6 @@
+.build
+build.log
+render-check/panel-*.png
+render-check/menu-*.png
+.DS_Store
+render-check/
