@@ -180,7 +180,7 @@ enum Alerts {
         p.executableURL = URL(fileURLWithPath: exe)
         p.arguments = Array(cmd.dropFirst()) + [w.title, w.body]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-        p.terminationHandler = { EventLog.write("alert command exited \($0.terminationStatus)") }
+        if enabled { p.terminationHandler = { EventLog.write("alert command exited \($0.terminationStatus)") } }   // not from the checks
         do { try p.run(); return p } catch { EventLog.write("alert command failed to run: \(error)"); return nil }
     }
 }
@@ -1062,7 +1062,8 @@ final class Model: ObservableObject {
         let holds = PowerHolds.live()
         guard ScreenIdle.shouldTurnOff(idleSeconds: idle, minutes: screenOffMinutes, screenAsleep: false, holds: holds) else { return }
         let forgotten = holds.filter(PowerHolds.forgotten)
-        EventLog.write("idle \(Int(idle / 60))m and the screen is held only by forgotten holds (\(forgotten.count) from \(Set(forgotten.map(\.process)).sorted().joined(separator: ", "))): screen off")
+        EventLog.write("idle \(Int(idle / 60))m and " + (forgotten.isEmpty ? "nothing holds the screen on" :
+            "only forgotten holds keep the screen on (\(forgotten.count) from \(Set(forgotten.map(\.process)).sorted().joined(separator: ", ")))") + ": screen off")
         ScreenIdle.turnOff()
     }
 
