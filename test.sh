@@ -16,5 +16,6 @@ bin="$tmp/Loaf.app/Contents/MacOS/Loaf"
 "$bin" --scan-bg | sed 's/^/ok: scan-bg /'
 "$bin" --test-holders
 "$bin" --test-interrupt
+"$bin" --test-power
 "$bin" --holders | tail -1 | sed 's/^/ok: live holders /'
 echo "all checks passed"

@@ -35,6 +35,9 @@ Close the lid on a long agent run and the Mac stays up until the last session fi
 - **Holds the Mac awake only while something runs.** A short grace period follows the last session, then the hold goes away.
 - **Keeps working with the lid shut.** With the optional sleep helper installed, the Mac stays awake closed, and a soft chime plays as the lid comes down so you know it heard you.
 - **Steps aside when asked.** "Let the Mac sleep" lets the Mac sleep on schedule until it next wakes, agents or not.
+- **Shows what else is holding the Mac up.** Under the sessions, every other app holding the screen or the Mac awake, read live: a call app's video locks, an app with its audio left open.
+- **Turns the screen off past forgotten locks.** Discord can keep its "Video Wake Lock" long after a call ends, so the screen never sleeps. After 20 minutes without input, when nothing else is holding the screen, Loaf turns it off. A browser really playing video still keeps it on.
+- **Watches the battery.** On battery the card shows the charge, and a notification comes at 20% and at 10%. At 10% Loaf stops keeping the Mac awake for agents, so it can sleep. To also reach your phone, point `alertCommand` at any program that takes a title and a body: `defaults write app.loaf.Loaf alertCommand -array /path/to/notify`.
 
 The menu-bar cat is solid while the Mac is held awake and an outline when it is free to sleep.
 

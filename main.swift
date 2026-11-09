@@ -3,6 +3,7 @@
 import AppKit
 import SwiftUI
 import AVFoundation
+import UserNotifications
 import CoreAudio
 import IOKit
 import IOKit.hid
@@ -122,7 +123,10 @@ enum IdleSleep {
     }
 
     /// `pmset -g` reports the settings currently in use, including the current power source.
-    static func sleepMinutes() -> Int? {
+    static func sleepMinutes() -> Int? { pmsetOutput(["-g"]).flatMap { sleepMinutes(in: $0) } }
+
+    /// What `pmset <args>` prints, or nil if it failed.
+    static func pmsetOutput(_ args: [String]) -> String? {
         // posix_spawn, not Process + Pipe: Foundation leaked about 5 KB per call here, once a minute.
         var fds: [Int32] = [0, 0]
         guard pipe(&fds) == 0 else { return nil }
@@ -135,7 +139,7 @@ enum IdleSleep {
         posix_spawn_file_actions_addclose(&actions, fds[1])
         posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
         var pid: pid_t = 0
-        let argv: [UnsafeMutablePointer<CChar>?] = [strdup(SleepHold.pmset), strdup("-g"), nil]
+        let argv: [UnsafeMutablePointer<CChar>?] = ([SleepHold.pmset] + args).map { strdup($0) } + [nil]
         defer { argv.forEach { free($0) } }
         let rc = posix_spawn(&pid, SleepHold.pmset, &actions, nil, argv, environ)
         close(fds[1])
@@ -150,8 +154,139 @@ enum IdleSleep {
         close(fds[0])
         var status: Int32 = 0
         waitpid(pid, &status, 0)
-        guard status == 0, let settings = String(data: data, encoding: .utf8) else { return nil }
-        return sleepMinutes(in: settings)
+        guard status == 0 else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+/// Alerts that must reach the user: a macOS notification, plus the command in `defaults write <bundle id> alertCommand
+/// -array <program> <args...>` (Loaf adds the title and the body), for a phone. Off in headless checks and renders.
+enum Alerts {
+    static var enabled = false
+    static func post(_ w: (title: String, body: String)) {
+        guard enabled else { return }
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            guard granted else { EventLog.write("notification not allowed\(error.map { ": \($0.localizedDescription)" } ?? "")"); return }
+            let c = UNMutableNotificationContent()
+            c.title = w.title; c.body = w.body; c.sound = .default
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+        }
+        if let cmd = UserDefaults.standard.stringArray(forKey: "alertCommand") { run(cmd, w) }
+    }
+    @discardableResult static func run(_ cmd: [String], _ w: (title: String, body: String)) -> Process? {
+        guard let exe = cmd.first else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = Array(cmd.dropFirst()) + [w.title, w.body]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { EventLog.write("alert command exited \($0.terminationStatus)") }
+        do { try p.run(); return p } catch { EventLog.write("alert command failed to run: \(error)"); return nil }
+    }
+}
+
+// MARK: - What is holding the screen and the Mac awake, as `pmset -g assertions` lists it by owning process
+
+/// One hold from the "Listed by owning process" part of `pmset -g assertions`. `forPid` is the app a system daemon
+/// holds for ("Created for PID: 41549." under a coreaudiod line: an app with its audio output left open).
+struct PowerHold: Equatable { var pid: Int32; var process: String; var type: String; var name: String; var forPid: Int32? = nil }
+
+enum PowerHolds {
+    static let displayTypes: Set = ["NoDisplaySleepAssertion", "PreventUserIdleDisplaySleep", "InternalPreventDisplaySleep"]
+    static let systemTypes: Set = ["NoIdleSleepAssertion", "PreventUserIdleSystemSleep", "PreventSystemSleep"]
+    /// macOS's own bookkeeping: "the display is on" and "the user just typed", never a reason the screen stays on.
+    static let bookkeeping: Set = ["powerd", "WindowServer"]
+
+    static func parse(_ text: String) -> [PowerHold] {
+        var holds: [PowerHold] = []
+        var listed = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("Listed by owning process") { listed = true; continue }
+            if line.hasPrefix("Kernel Assertions") { listed = false; continue }
+            guard listed else { continue }
+            if line.hasPrefix("Created for PID:"), !holds.isEmpty {
+                holds[holds.count - 1].forPid = Int32(line.dropFirst("Created for PID:".count).trimmingCharacters(in: CharacterSet(charactersIn: " .")))
+                continue
+            }
+            // pid 41425(Discord): [0x0007c4040005a4b5] 02:35:52 NoDisplaySleepAssertion named: "Video Wake Lock"
+            guard line.hasPrefix("pid "), let open = line.firstIndex(of: "("), let close = line.range(of: "): ["),
+                  let pid = Int32(line[line.index(line.startIndex, offsetBy: 4)..<open]),
+                  let named = line.range(of: " named: \"") else { continue }
+            let fields = line[close.upperBound..<named.lowerBound].split(separator: " ")
+            guard fields.count >= 3 else { continue }
+            var name = String(line[named.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if name.hasSuffix("\"") { name.removeLast() }
+            holds.append(PowerHold(pid: pid, process: String(line[line.index(after: open)..<close.lowerBound]),
+                                   type: String(fields[2]), name: name))
+        }
+        return holds
+    }
+
+    static func live() -> [PowerHold] { IdleSleep.pmsetOutput(["-g", "assertions"]).map(parse) ?? [] }
+
+    /// Holds that may be left behind and so never count against turning the screen off: Discord takes a "Video Wake
+    /// Lock" per call or stream and can keep them for hours after it ends.
+    /// Matched by app, not by name: Chrome uses the same name while a video really plays.
+    static func forgotten(_ h: PowerHold) -> Bool { h.process.hasPrefix("Discord") && h.name == "Video Wake Lock" }
+
+    /// Display holds that should keep the screen on.
+    static func screenBlockers(_ holds: [PowerHold]) -> [PowerHold] {
+        holds.filter { displayTypes.contains($0.type) && !bookkeeping.contains($0.process) && !forgotten($0) }
+    }
+
+    /// One card row per app, most holds first: what it holds ("screen on (15), audio") and how many holds in all.
+    /// `app` names the app behind a pid (fallback: the process name).
+    struct Row: Hashable { let app: String; let what: String; let count: Int }
+    static func rows(_ holds: [PowerHold], me: Int32 = getpid(),
+                     app: (Int32, String) -> String = { pid, process in owningApp(pid)?.localizedName ?? process }) -> [Row] {
+        var counts: [String: [String: Int]] = [:], order: [String] = []
+        for h in holds where !bookkeeping.contains(h.process) && h.pid != me && h.forPid != me {
+            let what: String
+            if displayTypes.contains(h.type) { what = "screen on" }
+            else if systemTypes.contains(h.type) { what = h.process == "coreaudiod" ? "audio" : "awake" }
+            else { continue }
+            let name = app(h.forPid ?? h.pid, h.process)
+            if counts[name] == nil { order.append(name) }
+            counts[name, default: [:]][what, default: 0] += 1
+        }
+        return order.map { name -> Row in
+            let kinds = counts[name]!.sorted { ($1.value, $0.key) < ($0.value, $1.key) }
+            return Row(app: name, what: kinds.map { $0.value > 1 ? "\($0.key) (\($0.value))" : $0.key }.joined(separator: ", "),
+                       count: kinds.reduce(0) { $0 + $1.value })
+        }.sorted { ($1.count, $0.app) < ($0.count, $1.app) }
+    }
+}
+
+enum ScreenIdle {
+    /// Turn the screen off: the user has been away `minutes`, the screen is still on, and nothing that matters is holding it.
+    static func shouldTurnOff(idleSeconds: Double, minutes: Int, screenAsleep: Bool, holds: [PowerHold]) -> Bool {
+        minutes > 0 && !screenAsleep && idleSeconds >= Double(minutes) * 60 && PowerHolds.screenBlockers(holds).isEmpty
+    }
+    static var screenAsleep: Bool { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
+    static func turnOff() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: SleepHold.pmset)
+        p.arguments = ["displaysleepnow"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { EventLog.write("pmset displaysleepnow failed to run: \(error)") }
+    }
+}
+
+enum BatteryAlert {
+    static let levels = [20, 10]
+    /// The level to alert for now (the lowest one crossed and not yet sent), and the levels sent so far on this charge.
+    /// Plugging in, or charging back above 25%, starts over.
+    static func next(percent: Int, onBattery: Bool, sent: Set<Int>) -> (alert: Int?, sent: Set<Int>) {
+        guard onBattery, percent <= 25 else { return (nil, []) }
+        let due = levels.filter { percent <= $0 && !sent.contains($0) }
+        guard let level = due.min() else { return (nil, sent) }
+        return (level, sent.union(due))
+    }
+    static func words(_ level: Int) -> (title: String, body: String) {
+        level <= 10
+            ? ("Mac battery at \(level)%", "Plug it in. Loaf has stopped keeping the Mac awake for agents, so it can sleep.")
+            : ("Mac battery at \(level)%", "Plug it in soon. At 10% Loaf stops keeping the Mac awake for agents.")
     }
 }
 
@@ -846,6 +981,22 @@ final class Model: ObservableObject {
             EventLog.write("lid chime switched \(chimeOnClose ? "on" : "off")")
         }
     }
+    /// Turn the screen off after `screenOffMinutes` (default 20; `defaults write <bundle id> screenOffMinutes`) without
+    /// input when only forgotten holds (PowerHolds.forgotten) keep it on.
+    @Published var screenOffWhenIdle: Bool = UserDefaults.standard.object(forKey: "screenOffWhenIdle") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(screenOffWhenIdle, forKey: "screenOffWhenIdle")
+            EventLog.write("screen off when idle switched \(screenOffWhenIdle ? "on" : "off")")
+        }
+    }
+    var screenOffMinutes: Int { (UserDefaults.standard.object(forKey: "screenOffMinutes") as? Int).map { max($0, 1) } ?? 20 }
+    /// The internal battery, read every refresh; nil on a Mac without one.
+    struct Battery: Equatable { let percent: Int; let onBattery: Bool }
+    @Published var battery: Battery?
+    private var batterySent: Set<Int> = []
+    /// What other apps hold awake, for the card; read while the card is open, at most every 10 s.
+    @Published var appHolds: [PowerHolds.Row] = []
+    private var appHoldsAt = Date.distantPast
     let film = Film()
     let hold = SleepHold()
     var onChange: (() -> Void)?
@@ -892,17 +1043,48 @@ final class Model: ObservableObject {
 
     /// Called once a minute by the app, never by headless checks or renders.
     func checkIdleSleep(now: Date = Date()) {
-        guard !awake, now.timeIntervalSince(lastWake) >= 120,
+        // at the battery floor (10%) agents no longer keep the Mac up: it sleeps when idle like any other day
+        let keepAwake = awake && hold.floor == nil
+        guard !keepAwake, now.timeIntervalSince(lastWake) >= 120,
               let minutes = IdleSleep.sleepMinutes(), minutes > 0 else { return }
         let holders = currentHolders()
         guard let idle = IdleSleep.idleSeconds(),
-              IdleSleep.shouldSleep(idleSeconds: idle, sleepMinutes: minutes, keepAwake: awake, allowSleep: allowSleep,
+              IdleSleep.shouldSleep(idleSeconds: idle, sleepMinutes: minutes, keepAwake: keepAwake, allowSleep: allowSleep,
                                     secondsSinceWake: now.timeIntervalSince(lastWake), holders: holders) else { return }
-        EventLog.write("idle \(Int(idle / 60))m with no agents; app holds \(holders.joined(separator: ", ")) ignored: sleeping the Mac now")
+        EventLog.write("idle \(Int(idle / 60))m with \(awake ? "agents held off by the safety floor (\(hold.floor ?? ""))" : "no agents"); app holds \(holders.joined(separator: ", ")) ignored: sleeping the Mac now")
         SleepHold.pmsetSleepNow()
     }
 
+    /// Called once a minute by the app. Reads the holds only once the user has been away long enough.
+    func checkScreenIdle() {
+        guard screenOffWhenIdle, !ScreenIdle.screenAsleep, let idle = IdleSleep.idleSeconds(),
+              idle >= Double(screenOffMinutes) * 60 else { return }
+        let holds = PowerHolds.live()
+        guard ScreenIdle.shouldTurnOff(idleSeconds: idle, minutes: screenOffMinutes, screenAsleep: false, holds: holds) else { return }
+        let forgotten = holds.filter(PowerHolds.forgotten)
+        EventLog.write("idle \(Int(idle / 60))m and the screen is held only by forgotten holds (\(forgotten.count) from \(Set(forgotten.map(\.process)).sorted().joined(separator: ", "))): screen off")
+        ScreenIdle.turnOff()
+    }
+
+    /// The card's list of other apps holding the screen or the Mac awake.
+    func refreshAppHolds(now: Date = Date()) {
+        guard now.timeIntervalSince(appHoldsAt) >= 10 else { return }
+        appHoldsAt = now
+        let rows = PowerHolds.rows(PowerHolds.live())
+        if rows != appHolds { appHolds = rows }
+    }
+
+    private func checkBattery() {
+        let b = SleepHold.battery().map { Battery(percent: $0.percent, onBattery: $0.onBattery) }
+        if b != battery { battery = b }
+        guard let b else { return }
+        let (alert, sent) = BatteryAlert.next(percent: b.percent, onBattery: b.onBattery, sent: batterySent)
+        batterySent = sent
+        if let alert { Alerts.post(BatteryAlert.words(alert)); EventLog.write("battery at \(b.percent)% on battery: \(alert)% alert sent") }
+    }
+
     func refresh(now: Date = Date()) {
+        checkBattery()
         let scan = Busy.scan(now: now)
         if scan != self.scan { self.scan = scan }
         if now.timeIntervalSince(lastBackground) >= 60 || now < lastBackground {   // about once a minute
@@ -1183,6 +1365,22 @@ struct HolderRow: View {
     }
 }
 
+/// One app holding the screen or the Mac awake: its name, what it holds, and how many holds.
+struct AppHoldRow: View {
+    let row: PowerHolds.Row
+    var detail: String { row.what }
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(row.app).font(.system(size: 12)).foregroundStyle(Ink.text).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+            Text(detail).font(.system(size: 11)).monospacedDigit().foregroundStyle(Ink.soft).fixedSize()
+        }
+        .padding(.horizontal, 12).frame(maxWidth: .infinity, minHeight: 26)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(row.app), \(detail)")
+    }
+}
+
 /// The footer action: full width, highlights under the pointer like a menu item, its shortcut on the right.
 final class Hover: ObservableObject { @Published var on = false }
 
@@ -1214,12 +1412,17 @@ struct Panel: View {
         let parts = [(model.scan.claude, "Claude"), (model.scan.codex, "Codex"),
                      (model.background.total, model.background.total == 1 ? "task" : "tasks")]
             .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
-        if !parts.isEmpty { return parts.joined(separator: "  ·  ") }
-        switch model.mood {
-        case .winding: return "Agents finished. Dozing off soon."
-        case .asleep: return model.allowSleep ? "Wakes up with the Mac." : "Wakes when an agent starts."
-        case .watching, .napping: return "Agents are working."
+        let line: String
+        if !parts.isEmpty { line = parts.joined(separator: "  ·  ") }
+        else {
+            switch model.mood {
+            case .winding: line = "Agents finished. Dozing off soon."
+            case .asleep: line = model.allowSleep ? "Wakes up with the Mac." : "Wakes when an agent starts."
+            case .watching, .napping: line = "Agents are working."
+            }
         }
+        guard let b = model.battery, b.onBattery else { return line }
+        return line + "  ·  battery \(b.percent)%"
     }
 
     var body: some View {
@@ -1258,6 +1461,18 @@ struct Panel: View {
                     .transition(.opacity)
                 }
             }
+            // Other apps holding the screen or the Mac awake, read live while the card is open.
+            if !model.appHolds.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Other apps").font(.system(size: 11)).foregroundStyle(Ink.soft)
+                        .padding(.horizontal, 12).frame(minHeight: 22)
+                    ForEach(model.appHolds, id: \.self) { AppHoldRow(row: $0) }
+                }
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Ink.group))
+                .padding(.horizontal, 8).padding(.bottom, 8)
+                .transition(.opacity)
+            }
             VStack(spacing: 0) {
                 SettingRow(label: "Chime when the lid closes", help: "Plays a short chime as the lid shuts", on: Binding(
                     get: { model.chimeOnClose },
@@ -1265,6 +1480,9 @@ struct Panel: View {
                 Rectangle().fill(Ink.faint).frame(height: 1).padding(.leading, 12)
                 SettingRow(label: "Let the Mac sleep", help: "Sleep on schedule even while agents work, until the Mac next wakes", on: Binding(
                     get: { model.allowSleep }, set: { _ in model.toggleAllowSleep() }))
+                Rectangle().fill(Ink.faint).frame(height: 1).padding(.leading, 12)
+                SettingRow(label: "Screen off after \(model.screenOffMinutes) min idle",
+                           help: "Turns the screen off when nothing but a forgotten hold (Discord's video lock) keeps it on", on: $model.screenOffWhenIdle)
             }
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Ink.group))
             .padding(.horizontal, 8)
@@ -1329,6 +1547,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.model.refresh()
             self?.model.checkIdleSleep()
+            self?.model.checkScreenIdle()
         }
         _ = Chime.shared   // decode the chime now so it is ready the instant the lid moves
         lid.onClose = { [weak self] reason in self?.model.lidDidClose(reason: reason) }
@@ -1345,6 +1564,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         term.setEventHandler { [weak self] in self?.model.hold.releaseNow(); EventLog.write("SIGTERM: exiting"); exit(0) }
         term.resume()
         termSource = term
+        Alerts.enabled = true
         EventLog.write("Loaf started, Lid chime \(model.chimeOnClose ? "on" : "off")")
     }
 
@@ -1388,6 +1608,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A click on the cat while the card is open first takes key away from the card, which closes it.
         if card.isVisible || Date().timeIntervalSince(closedAt) < 0.3 { close(); return }
         model.refresh()
+        model.refreshAppHolds()
         if host.superview == nil { card.contentView?.addSubview(host) }
         place()
         let end = card.frame
@@ -1408,6 +1629,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fast = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.model.refresh()
+            self.model.refreshAppHolds()
         }
     }
 
@@ -1521,7 +1743,11 @@ if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
             }
             m.scan = n > 0 ? Busy.Scan(claude: sessions.count, codex: 0, sessions: sessions) : Busy.Scan()
             m.background = bg
-            if state == "live" { m.awake = true; m.scan = Busy.scan(now: now); m.background = Busy.scanBackground(now: now) }
+            if state == "live" {
+                m.awake = true; m.scan = Busy.scan(now: now); m.background = Busy.scanBackground(now: now)
+                m.appHolds = PowerHolds.rows(PowerHolds.live())
+                m.battery = SleepHold.battery().map { Model.Battery(percent: $0.percent, onBattery: $0.onBattery) }
+            }
             let host = NSHostingView(rootView: Panel(model: m))
             host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
             host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -1666,6 +1892,74 @@ if args.contains("--test-interrupt") {   // a stopped turn stops counting at onc
     print(got == want ? "PASS interrupt: a stopped turn stops counting, a resumed one counts" :
                         "FAIL interrupt: counted \(got.sorted()), want \(want.sorted())")
     exit(got == want ? 0 : 1)
+}
+if args.contains("--test-power") {   // what holds the screen and the Mac awake, screen off when idle, battery alerts
+    // A real `pmset -g assertions` with 15 forgotten Discord video locks
+    let fixture = """
+    Assertion status system-wide:
+       PreventUserIdleDisplaySleep    1
+       PreventUserIdleSystemSleep     1
+    Listed by owning process:
+       pid 364(powerd): [0x0007c3f70001a498] 02:36:05 PreventUserIdleSystemSleep named: "Powerd - Prevent sleep while display is on"
+       pid 364(powerd): [0x0007e34400108341] 00:02:40 InternalPreventDisplaySleep named: "com.apple.powermanagement.delayDisplayOff"
+    \tTimeout will fire in 140 secs Action=TimeoutActionTurnOff
+       pid 549(coreaudiod): [0x0007cf2900019307] 01:48:19 PreventUserIdleSystemSleep named: "com.apple.audio.BuiltInSpeakerDevice.context.preventuseridlesleep"
+    \tCreated for PID: 25144.
+    \tResources: audio-out BuiltInSpeakerDevice
+       pid 549(coreaudiod): [0x0007c3f800018409] 02:36:04 PreventUserIdleSystemSleep named: "com.apple.audio.BuiltInSpeakerDevice.context.preventuseridlesleep"
+    \tCreated for PID: 41549.
+    \tResources: audio-out BuiltInSpeakerDevice
+
+    """ + (0..<15).map { "   pid 41425(Discord): [0x0007c4040005a4\(String(format: "%02x", 0xa7 + $0))] 02:35:52 NoDisplaySleepAssertion named: \"Video Wake Lock\"  \n" }.joined() + """
+       pid 421(WindowServer): [0x0007e7ae000982c8] 00:00:01 UserIsActive named: "com.apple.iohideventsystem.queue.tickle"
+    \tTimeout will fire in 10798 secs Action=TimeoutActionRelease
+       pid 41857(Claude): [0x0007d1920001a63e] 01:38:01 NoIdleSleepAssertion named: "Electron"
+    Kernel Assertions: 0x100=MAGICWAKE
+       id=563  level=255 0x100=MAGICWAKE creat=  mod= description=en0 owner=IOSkywalkNetworkBSDClient
+    """
+    var failures = 0
+    func check(_ ok: Bool, _ what: String) { print("\(ok ? "PASS" : "FAIL") \(what)"); if !ok { failures += 1 } }
+    let holds = PowerHolds.parse(fixture)
+    check(holds.count == 21, "parse: 21 holds (got \(holds.count))")
+    check(holds.filter { $0.process == "Discord" && $0.type == "NoDisplaySleepAssertion" && $0.name == "Video Wake Lock" }.count == 15,
+          "parse: Discord's 15 video wake locks")
+    check(holds.filter { $0.process == "coreaudiod" }.map(\.forPid) == [25144, 41549], "parse: coreaudiod holds name the app they hold for")
+    check(holds.contains(PowerHold(pid: 41857, process: "Claude", type: "NoIdleSleepAssertion", name: "Electron")), "parse: Claude's system hold")
+    let names: [Int32: String] = [25144: "Spotify", 41549: "Discord", 41425: "Discord", 41857: "Claude"]
+    let rows = PowerHolds.rows(holds, me: 1) { pid, process in names[pid] ?? process }
+    let want = [PowerHolds.Row(app: "Discord", what: "screen on (15), audio", count: 16), .init(app: "Claude", what: "awake", count: 1),
+                .init(app: "Spotify", what: "audio", count: 1)]
+    check(rows == want, "card rows: one per app, Discord screen on (15) and audio first (got \(rows.map { "\($0.app): \($0.what)" }))")
+    check(ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 20, screenAsleep: false, holds: holds), "screen off: idle 25m, only Discord's forgotten locks")
+    check(!ScreenIdle.shouldTurnOff(idleSeconds: 10 * 60, minutes: 20, screenAsleep: false, holds: holds), "screen stays: idle 10m of 20")
+    check(!ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 20, screenAsleep: true, holds: holds), "screen stays: already off")
+    check(!ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 0, screenAsleep: false, holds: holds), "screen stays: setting off")
+    let video = PowerHolds.parse("Listed by owning process:\n   pid 777(Google Chrome Helper): [0x1] 00:10:00 NoDisplaySleepAssertion named: \"Video Wake Lock\"\n")
+    check(video.count == 1 && !ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 20, screenAsleep: false, holds: holds + video),
+          "screen stays: a browser is really playing video")
+    var sent: Set<Int> = [], got: [String] = []
+    for (pct, onBattery) in [(30, true), (21, true), (20, true), (19, true), (11, true), (10, true), (8, true), (8, false), (50, true), (9, true), (5, true)] {
+        let r = BatteryAlert.next(percent: pct, onBattery: onBattery, sent: sent); sent = r.sent
+        if let a = r.alert { got.append("\(pct):\(a)") }
+    }
+    let out = FileManager.default.temporaryDirectory.appendingPathComponent("loaf-alert-\(getpid())").path
+    defer { try? FileManager.default.removeItem(atPath: out) }
+    let p = Alerts.run(["/bin/sh", "-c", "printf '%s|%s' \"$1\" \"$2\" > \(out)", "alert"], BatteryAlert.words(20))
+    p?.waitUntilExit()
+    check((try? String(contentsOfFile: out, encoding: .utf8)) == "Mac battery at 20%|Plug it in soon. At 10% Loaf stops keeping the Mac awake for agents.",
+          "the alert command gets the title and the body")
+    check(got == ["20:20", "10:10", "9:10"], "battery alerts once at 20% and 10%; plugged in starts over; a drop past both alerts once (got \(got))")
+    exit(failures == 0 ? 0 : 1)
+}
+if args.contains("--power") {   // prints the live holds as the card lists them, and whether the screen would go off now
+    let holds = PowerHolds.live(), m = Model()
+    for r in PowerHolds.rows(holds) { print("\(r.app) | \(r.what)") }
+    let idle = IdleSleep.idleSeconds() ?? 0, blockers = PowerHolds.screenBlockers(holds)
+    print("idle \(Int(idle))s, screen \(ScreenIdle.screenAsleep ? "off" : "on"), setting \(m.screenOffWhenIdle ? "\(m.screenOffMinutes) min" : "off"), " +
+          "screen held by \(blockers.isEmpty ? "nothing that counts" : Set(blockers.map(\.process)).sorted().joined(separator: ", ")), " +
+          "would turn off now: \(m.screenOffWhenIdle && ScreenIdle.shouldTurnOff(idleSeconds: idle, minutes: m.screenOffMinutes, screenAsleep: ScreenIdle.screenAsleep, holds: holds))")
+    if let b = SleepHold.battery() { print("battery \(b.percent)% \(b.onBattery ? "on battery" : "on power")") }
+    exit(0)
 }
 if args.contains("--holders") {   // prints the card's "keeping it awake" rows from the live scans; never touches the sleep hold
     let m = Model(), now = Date(), t0 = CACurrentMediaTime()
