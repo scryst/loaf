@@ -21,9 +21,11 @@ cat > "$dest.new/Contents/Info.plist" <<PLIST
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>2.0</string>
 <key>LSUIElement</key><true/>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
 </dict></plist>
 PLIST
 codesign --force --sign - "$dest.new"
-if [[ -d "$dest" ]]; then trash "$dest"; fi
+# the old bundle goes to the Trash where this macOS has `trash`, and is removed where it does not
+if [[ -d "$dest" ]]; then if command -v trash >/dev/null; then trash "$dest"; else rm -rf "$dest"; fi; fi
 mv "$dest.new" "$dest"
 echo "built $dest"

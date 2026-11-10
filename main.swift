@@ -1410,7 +1410,8 @@ struct Panel: View {
 
     /// One plain line under the status: who is keeping it up, or what happens next.
     var summary: String {
-        let parts = [(model.scan.claude, "Claude"), (model.scan.codex, "Codex"),
+        let parts = [(model.scan.claude, model.scan.claude == 1 ? "Claude session" : "Claude sessions"),
+                     (model.scan.codex, model.scan.codex == 1 ? "Codex session" : "Codex sessions"),
                      (model.background.total, model.background.total == 1 ? "task" : "tasks")]
             .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         let line: String
@@ -1732,7 +1733,7 @@ if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
             m.awake = state == "awake" || state == "winding"
             m.allowSleep = state == "allowed"
             // awake: more sessions than fit (long titles, a background-only one); allowed: two
-            let now = Date(), names = ["Refactor the sync engine and keep every test green", "Release notes", "Docs site", "Flaky test",
+            let now = Date(), names = ["Sync engine refactor", "Release notes", "Docs site", "Flaky test",
                                        "Migrate settings to the new schema", "Icon polish", "Benchmark the parser on large inputs"]
             let n = state == "awake" ? names.count : state == "allowed" ? 2 : 0
             var sessions: [String: Date] = [:], bg = Busy.Background()
@@ -1744,6 +1745,8 @@ if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
             }
             m.scan = n > 0 ? Busy.Scan(claude: sessions.count, codex: 0, sessions: sessions) : Busy.Scan()
             m.background = bg
+            // other apps holding the screen or the Mac, as the card lists them while they do
+            if state != "allowed" { m.appHolds = [.init(app: "Discord", what: "screen on (15), audio", count: 16), .init(app: "Spotify", what: "audio", count: 1)] }
             if state == "live" {
                 m.awake = true; m.scan = Busy.scan(now: now); m.background = Busy.scanBackground(now: now)
                 m.appHolds = PowerHolds.rows(PowerHolds.live())
