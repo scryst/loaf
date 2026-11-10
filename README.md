@@ -7,7 +7,9 @@
 
 <h1 align="center">Loaf</h1>
 
-<p align="center">Keeps your Mac awake while coding agents work, lid open or shut,<br>and lets it sleep when they're done. Free and open source.</p>
+<p align="center">Keeps your Mac awake while coding agents work, lid open or shut, and lets it sleep when they're done.</p>
+
+<p align="center">Free and open source.</p>
 
 <br>
 

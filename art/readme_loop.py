@@ -48,7 +48,8 @@ def main(render_dir, out_dir):
         panels = {}
         for state in {s for s, _ in SEQUENCE}:
             p = Image.open(os.path.join(render_dir, f"panel-{state}-{'dark' if dark else 'light'}.png")).convert('RGB')
-            p.paste(p.crop((0, 1, p.width, 2)), (0, 0))   # the render's top row is the window edge, not the card
+            p.paste(p.crop((0, 1, p.width, 2)), (0, 0))   # the render's top and bottom rows are the window edge, not the card
+            p.paste(p.crop((0, p.height - 2, p.width, p.height - 1)), (0, p.height - 1))
             panels[state] = p
         w = max(p.width for p in panels.values()) + 2 * PAD
         h = max(p.height for p in panels.values()) + 2 * PAD
