@@ -1,7 +1,9 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/loaf-dark.webp">
-    <img src="docs/loaf-light.webp" width="340" alt="Loaf's card while six sessions work. The cat looks around, then the agents finish, the cat settles into a loaf and sleeps, and wakes when an agent starts again.">
+    <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/banner-phone-dark.webp">
+    <source media="(max-width: 600px)" srcset="docs/banner-phone-light.webp">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.webp">
+    <img src="docs/banner-light.webp" width="100%" alt="The Loaf cat, printed in blue lines: it flicks an ear, looks around, settles into a loaf, sleeps, and wakes.">
   </picture>
 </p>
 
@@ -14,6 +16,13 @@
 <br>
 
 Close the lid on a long agent run and walk away. The Mac stays up until the last session finishes, the cat in the menu bar settles down two minutes later, and the Mac goes back to sleeping on its usual schedule. There is nothing to turn off afterwards.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/loaf-dark.webp">
+    <img src="docs/loaf-light.webp" width="340" alt="Loaf's card while six sessions work and a test run goes on in the background. The agents finish, the cat settles into a loaf and sleeps, and wakes when an agent starts again.">
+  </picture>
+</p>
 
 Click the cat to see who is keeping it up: each working session by its title, how long it has run, and any background tasks it left going. Claude Code reports through hooks, Codex through the session files it writes as it works, and a background task counts for as long as it keeps writing output. Stopping a turn halfway counts as finishing it, and "Let the Mac sleep" in the card lets the Mac sleep on schedule while agents work, until it next wakes.
 
@@ -70,7 +79,7 @@ Then remove the entries that mention `loaf-busy-hook` from `~/.claude/settings.j
 ./test.sh
 ```
 
-Builds into a temporary folder and runs the install, hook and headless checks without touching the copy you are running. `LOAF_RENDER=<dir>` draws every state of the card in light and dark, and `art/readme_loop.py` turns those renders and the cat's clips into the loop at the top of this page.
+Builds into a temporary folder and runs the install, hook and headless checks without touching the copy you are running. `LOAF_RENDER=<dir>` draws every state of the card in light and dark, `art/readme_loop.py` turns those renders and the cat's clips into the card loop on this page, and `art/banner.py` prints the clips for the banner at the top.
 
 ## License
 

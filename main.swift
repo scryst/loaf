@@ -1327,7 +1327,23 @@ struct CatView: View {
     }
 }
 
-/// One settings row, the way System Settings draws it: the label on the left, a native switch on the right.
+/// The card's switch: the native small switch's size, shape and off color, the accent when on. AppKit's own switch draws
+/// its on state in the accent only while its app is active, and the card is a non-activating panel (every
+/// off-screen render drew the on switches gray, even in a window that reported itself key).
+struct CardSwitch: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        let on = configuration.isOn
+        return Capsule()
+            .fill(on ? Loaf.accent : Ink.faint)
+            .frame(width: 44, height: 20)
+            .overlay(alignment: on ? .trailing : .leading) {   // the knob is a pill, as macOS draws it
+                Capsule().fill(Color.white).shadow(color: .black.opacity(0.22), radius: 1, y: 0.5).frame(width: 26, height: 16).padding(2)
+            }
+            .animation(.easeOut(duration: 0.18), value: on)
+    }
+}
+
+/// One settings row, the way System Settings draws it: the label on the left, a switch on the right.
 struct SettingRow: View {
     let label: String, help: String
     @Binding var on: Bool
@@ -1335,7 +1351,7 @@ struct SettingRow: View {
         HStack(spacing: 12) {
             Text(label).font(.system(size: 13)).foregroundStyle(Ink.text)
             Spacer(minLength: 0)
-            Toggle(label, isOn: $on).labelsHidden().toggleStyle(.switch).controlSize(.small).tint(Loaf.accent)
+            Toggle(label, isOn: $on).labelsHidden().toggleStyle(CardSwitch())
         }
         .padding(.horizontal, 12).frame(maxWidth: .infinity, minHeight: 36)
         .contentShape(Rectangle()).onTapGesture { on.toggle() }
