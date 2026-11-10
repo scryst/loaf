@@ -235,18 +235,21 @@ enum PowerHolds {
         holds.filter { displayTypes.contains($0.type) && !bookkeeping.contains($0.process) && !forgotten($0) }
     }
 
-    /// One card row per app, most holds first: what it holds ("screen on (15), audio") and how many holds in all.
-    /// `app` names the app behind a pid (fallback: the process name).
+    /// One card row per app, most holds first: what it holds ("screen on (2), audio") and how many holds in all.
+    /// `app` names the app behind a pid, or nil for a background service with no app (sharingd during AirDrop), which is
+    /// left out too. Also left out: macOS's own bookkeeping, leftover holds
+    /// (PowerHolds.forgotten: they say nothing about what is running, and screen-off already looks past them), and the
+    /// Claude app's own hold, which is the sessions the card lists above.
     struct Row: Hashable { let app: String; let what: String; let count: Int }
     static func rows(_ holds: [PowerHold], me: Int32 = getpid(),
-                     app: (Int32, String) -> String = { pid, process in owningApp(pid)?.localizedName ?? process }) -> [Row] {
+                     app: (Int32, String) -> String? = { pid, _ in owningApp(pid)?.localizedName }) -> [Row] {
         var counts: [String: [String: Int]] = [:], order: [String] = []
-        for h in holds where !bookkeeping.contains(h.process) && h.pid != me && h.forPid != me {
+        for h in holds where !bookkeeping.contains(h.process) && !forgotten(h) && h.pid != me && h.forPid != me {
             let what: String
             if displayTypes.contains(h.type) { what = "screen on" }
             else if systemTypes.contains(h.type) { what = h.process == "coreaudiod" ? "audio" : "awake" }
             else { continue }
-            let name = app(h.forPid ?? h.pid, h.process)
+            guard let name = app(h.forPid ?? h.pid, h.process), !(name == "Claude" && h.forPid == nil) else { continue }
             if counts[name] == nil { order.append(name) }
             counts[name, default: [:]][what, default: 0] += 1
         }
@@ -1733,8 +1736,8 @@ if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
             m.awake = state == "awake" || state == "winding"
             m.allowSleep = state == "allowed"
             // awake: more sessions than fit (long titles, a background-only one); allowed: two
-            let now = Date(), names = ["Sync engine refactor", "Release notes", "Docs site", "Flaky test",
-                                       "Migrate settings to the new schema", "Icon polish", "Benchmark the parser on large inputs"]
+            let now = Date(), names = ["Sync refactor", "Fix the flaky upload test", "Add dark mode to settings", "Full test suite",
+                                       "Settings migration", "Profile cold start", "Release notes"]
             let n = state == "awake" ? names.count : state == "allowed" ? 2 : 0
             var sessions: [String: Date] = [:], bg = Busy.Background()
             for i in 0..<n {
@@ -1746,7 +1749,8 @@ if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
             m.scan = n > 0 ? Busy.Scan(claude: sessions.count, codex: 0, sessions: sessions) : Busy.Scan()
             m.background = bg
             // other apps holding the screen or the Mac, as the card lists them while they do
-            if state != "allowed" { m.appHolds = [.init(app: "Discord", what: "screen on (15), audio", count: 16), .init(app: "Spotify", what: "audio", count: 1)] }
+            // a long build kept up with `caffeinate` in a terminal, as the card lists it while it runs
+            if state == "awake" { m.appHolds = [.init(app: "Terminal", what: "awake", count: 1)] }
             if state == "live" {
                 m.awake = true; m.scan = Busy.scan(now: now); m.background = Busy.scanBackground(now: now)
                 m.appHolds = PowerHolds.rows(PowerHolds.live())
@@ -1930,10 +1934,12 @@ if args.contains("--test-power") {   // what holds the screen and the Mac awake,
     check(holds.filter { $0.process == "coreaudiod" }.map(\.forPid) == [25144, 41549], "parse: coreaudiod holds name the app they hold for")
     check(holds.contains(PowerHold(pid: 41857, process: "Claude", type: "NoIdleSleepAssertion", name: "Electron")), "parse: Claude's system hold")
     let names: [Int32: String] = [25144: "Spotify", 41549: "Discord", 41425: "Discord", 41857: "Claude"]
-    let rows = PowerHolds.rows(holds, me: 1) { pid, process in names[pid] ?? process }
-    let want = [PowerHolds.Row(app: "Discord", what: "screen on (15), audio", count: 16), .init(app: "Claude", what: "awake", count: 1),
-                .init(app: "Spotify", what: "audio", count: 1)]
-    check(rows == want, "card rows: one per app, Discord screen on (15) and audio first (got \(rows.map { "\($0.app): \($0.what)" }))")
+    let rows = PowerHolds.rows(holds, me: 1) { pid, _ in names[pid] }
+    let want = [PowerHolds.Row(app: "Discord", what: "audio", count: 1), .init(app: "Spotify", what: "audio", count: 1)]
+    check(rows == want, "card rows: leftover video locks and Claude's own hold left out, one row per app (got \(rows.map { "\($0.app): \($0.what)" }))")
+    let build = PowerHolds.parse("Listed by owning process:\n   pid 77(sharingd): [0x1] 00:00:20 PreventUserIdleSystemSleep named: \"Handoff\"\n   pid 900(caffeinate): [0x2] 00:41:00 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"\n   pid 901(caffeinate): [0x3] 00:12:00 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"\n")
+    check(PowerHolds.rows(build, me: 1) { pid, _ in pid >= 900 ? "Terminal" : nil } == [.init(app: "Terminal", what: "awake (2)", count: 2)],
+          "card rows: two caffeinated builds from Terminal collapse to one row; a background service with no app is left out")
     check(ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 20, screenAsleep: false, holds: holds), "screen off: idle 25m, only Discord's forgotten locks")
     check(!ScreenIdle.shouldTurnOff(idleSeconds: 10 * 60, minutes: 20, screenAsleep: false, holds: holds), "screen stays: idle 10m of 20")
     check(!ScreenIdle.shouldTurnOff(idleSeconds: 25 * 60, minutes: 20, screenAsleep: true, holds: holds), "screen stays: already off")

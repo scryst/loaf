@@ -23,7 +23,7 @@ macOS sleeps a closed MacBook no matter what an app asks, so holding it open nee
 
 ## When something else is keeping it up
 
-The card also lists other apps holding the screen or the Mac awake, read live. Discord, for one, can keep its video locks for hours after a call ends, so the screen never turns off. After 20 minutes without input, when nothing but locks like that is holding the screen, Loaf turns it off. A browser really playing a video still keeps it on. The switch is in the card.
+Below your sessions the card lists anything else holding the Mac or the screen awake, read live: a long build you wrapped in `caffeinate`, a player with its audio still open. Some apps take a screen lock and never let it go. After 20 minutes without input, when only a lock like that is holding the screen, Loaf turns the screen off. A browser really playing a video still keeps it on. The switch is in the card.
 
 ## On battery
 
