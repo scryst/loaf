@@ -28,7 +28,7 @@ Click the cat to see who is keeping it up: each working session by its title, ho
 
 ## With the lid shut
 
-macOS sleeps a closed MacBook no matter what an app asks, so holding it open needs one small helper that you install with sudo (below). With it, the lid comes down without the Mac sleeping, and a soft chime plays as it closes so you know Loaf heard it. Loaf lets go at 10% battery or when the Mac runs hot, and puts a shut Mac to sleep right away when it does. If Loaf quits or crashes, a watchdog turns sleep back on within a minute.
+macOS sleeps a closed MacBook no matter what an app asks, so holding it open needs one small helper that you install with sudo (below). Until it is in, the card says that closing the lid will still sleep the Mac. With it, the lid comes down without the Mac sleeping, and a soft chime plays as it closes so you know Loaf heard it. Loaf lets go at 10% battery or when the Mac runs hot, and puts a shut Mac to sleep right away when it does. If Loaf quits or crashes, a watchdog turns sleep back on within a minute.
 
 ## When something else is keeping it up
 
@@ -36,7 +36,7 @@ Below your sessions the card lists anything else holding the Mac or the screen a
 
 ## On battery
 
-The card shows the charge, and a notification comes at 20% and again at 10%. At 10% Loaf stops counting your agents as a reason to stay up, so an idle Mac can sleep before it runs flat. To hear about it on your phone as well, point `alertCommand` at any program that takes a title and a message:
+The card shows the charge, and a notification comes at 20% and again at 10%. At 10% Loaf stops counting your agents as a reason to stay up, so an idle Mac can sleep before it runs flat, and it starts again once the charge is back above 14% or the Mac is plugged in. To hear about it on your phone as well, point `alertCommand` at any program that takes a title and a message:
 
 ```bash
 defaults write app.loaf.Loaf alertCommand -array /path/to/your/notifier
@@ -51,7 +51,7 @@ git clone https://github.com/scryst/loaf.git && cd loaf
 ./install.sh
 ```
 
-This builds `Loaf.app` into `~/Applications`, adds Loaf's hooks to `~/.claude/settings.json` (it backs the file up first and leaves your other hooks alone), and starts Loaf at login with its watchdog.
+This builds `Loaf.app` into `~/Applications`, adds Loaf's hooks to `~/.claude/settings.json` (it backs the file up first and leaves your other hooks alone), and starts Loaf at login with its watchdog. Quit Loaf from the card and it stays off until you next log in or open `~/Applications/Loaf.app`.
 
 To keep the Mac awake with the lid shut, add the helper once:
 
@@ -63,7 +63,10 @@ It is a single sudoers rule that lets your user run `pmset -a disablesleep 0` an
 
 ## Uninstall
 
+From the folder you installed from, take Loaf's hooks out of `~/.claude/settings.json` first (your other hooks stay), then remove the rest:
+
 ```bash
+python3 install-hooks.py --remove
 launchctl bootout gui/$UID/app.loaf.Loaf; launchctl bootout gui/$UID/app.loaf.Loaf.watchdog
 rm ~/Library/LaunchAgents/app.loaf.Loaf*.plist
 rm -rf ~/Applications/Loaf.app ~/Library/Application\ Support/Loaf ~/Library/Logs/Loaf
@@ -71,7 +74,7 @@ defaults delete app.loaf.Loaf
 sudo rm -f /etc/sudoers.d/loaf
 ```
 
-Then remove the entries that mention `loaf-busy-hook` from `~/.claude/settings.json`.
+If you had a `~/.claude/settings.json` before, the install kept a copy of it as `settings.json.bak-loaf-<date>` beside it; delete that whenever you like.
 
 ## Development
 

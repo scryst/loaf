@@ -43,6 +43,16 @@ def card(panel, frame):
     return out
 
 
+def dissolve(a, b, t):
+    """Cross-fade two RGBA frames in premultiplied color, so a card fading out stays its own color as it goes clear
+    (PIL's blend mixes in the transparent pixels' black, which grays the taller card out)."""
+    fa, fb = (np.asarray(x, np.float32) / 255 for x in (a, b))
+    pa, pb = fa[..., :3] * fa[..., 3:], fb[..., :3] * fb[..., 3:]
+    alpha = (1 - t) * fa[..., 3:] + t * fb[..., 3:]
+    rgb = ((1 - t) * pa + t * pb) / np.maximum(alpha, 1e-6)
+    return Image.fromarray((np.dstack([rgb, alpha]) * 255 + .5).clip(0, 255).astype(np.uint8), 'RGBA')
+
+
 def main(render_dir, out_dir):
     for dark in (False, True):
         panels = {}
@@ -59,18 +69,18 @@ def main(render_dir, out_dir):
             cards += [(state, card(panels[state], f)) for f in clip_frames(clip, dark)]
         frames, prev, fade_from, fade_left = [], None, None, 0
         for i, (state, c) in enumerate(cards):
-            img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+            img = Image.new('RGBA', (w, h), (0, 0, 0, 0))   # the card on its shadow; a state change dissolves the whole frame
             sh = Image.new('RGBA', (w, h), (0, 0, 0, 0))
             sh.paste((0, 0, 0, shadow_alpha), (PAD, PAD + 10), c.getchannel('A'))
             img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(18)))
-            layer = Image.new('RGBA', (w, h), (0, 0, 0, 0)); layer.paste(c, (PAD, PAD))
+            img.alpha_composite(c, (PAD, PAD))
             if prev is not None and prev[0] != state:      # the state just changed: fade from the last card over FADE frames
                 fade_from, fade_left = prev[1], FADE
+            shown = img
             if fade_left > 0:
-                layer = Image.blend(fade_from, layer, 1 - fade_left / (FADE + 1)); fade_left -= 1
-            img.alpha_composite(layer)
-            frames.append(img.resize((round(w * SCALE), round(h * SCALE)), Image.LANCZOS))
-            prev = (state, layer)
+                shown = dissolve(fade_from, img, 1 - fade_left / (FADE + 1)); fade_left -= 1
+            frames.append(shown.resize((round(w * SCALE), round(h * SCALE)), Image.LANCZOS))
+            prev = (state, img)
         out = os.path.join(out_dir, f"loaf-{'dark' if dark else 'light'}.webp")
         frames[0].save(out, save_all=True, append_images=frames[1:], duration=round(1000 * STEP / 24), loop=0,
                        quality=40, method=6, minimize_size=True, allow_mixed=True)

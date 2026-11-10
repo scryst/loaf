@@ -6,7 +6,7 @@ import glob, json, os, subprocess, sys, tempfile, unittest
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "install-hooks.py")
 EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
-GATE = {"hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/budget_caps.py"}]}
+GATE = {"hooks": [{"type": "command", "command": "~/bin/other-hook.sh"}]}
 
 
 class InstallHooks(unittest.TestCase):
@@ -19,9 +19,9 @@ class InstallHooks(unittest.TestCase):
     def tearDown(self):
         self.home.cleanup()
 
-    def run_script(self):
+    def run_script(self, *flags):
         env = dict(os.environ, HOME=self.home.name)
-        return subprocess.run([sys.executable, "-I", SCRIPT, self.path], env=env, capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", SCRIPT, *flags, self.path], env=env, capture_output=True, text=True)
 
     def write(self, data):
         with open(self.path, "w") as f:
@@ -87,6 +87,24 @@ class InstallHooks(unittest.TestCase):
         self.assertNotIn("/old/", cmds[0])
         self.assertIn("busy hooks installed in", r.stdout)
         self.assertNotIn("already", r.stdout)
+
+    def test_remove_takes_ours_out_and_keeps_the_rest(self):
+        self.write({"model": "x", "hooks": {"PreToolUse": [GATE], "Stop": [GATE]}})
+        self.run_script()
+        r = self.run_script("--remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(self.read_bytes())
+        self.assertEqual(data, {"model": "x", "hooks": {"PreToolUse": [GATE], "Stop": [GATE]}})
+        self.write({"hooks": {}}); self.run_script(); self.run_script("--remove")
+        self.assertEqual(json.loads(self.read_bytes()), {})   # nothing of ours left, not even an empty "hooks"
+
+    def test_remove_without_ours_writes_nothing(self):
+        self.write({"hooks": {"Stop": [GATE]}})
+        before = self.read_bytes()
+        r = self.run_script("--remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
 
     def test_invalid_json_writes_nothing(self):
         with open(self.path, "w") as f:

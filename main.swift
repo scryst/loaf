@@ -419,6 +419,13 @@ func lidClosed() -> Bool {
     return (v?.takeRetainedValue() as? Bool) ?? false
 }
 
+/// A desktop Mac has no clamshell switch, so it has no lid for the sleep helper to matter to.
+func hasLid() -> Bool {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    defer { IOObjectRelease(root) }
+    return IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() != nil
+}
+
 final class LidWatch {
     /// Start the chime flow when the lid falls below this many degrees while closing; it re-arms once the lid is above `rearmAngle`.
     static let triggerAngle = 45.0, rearmAngle = 60.0
@@ -547,7 +554,9 @@ final class SleepHold {
     static let pmset = "/usr/bin/pmset"
     /// Only the `--fake-sudo` test hook changes this.
     static var sudo = "/usr/bin/sudo"
-    private(set) var available = false
+    private(set) var available = false { didSet { onAvailability?(available) } }
+    /// The card shows a line when the helper is missing; called on the main queue.
+    var onAvailability: ((Bool) -> Void)?
     private(set) var held = false
     /// Why the safety floor is keeping the hold off, while it is.
     private(set) var floor: String?
@@ -1002,6 +1011,8 @@ final class Model: ObservableObject {
     private var appHoldsAt = Date.distantPast
     let film = Film()
     let hold = SleepHold()
+    /// The launch probe found no working sleep helper, so closing the lid will still sleep the Mac.
+    @Published var helperMissing = false
     var onChange: (() -> Void)?
     var lastChime = Date.distantPast
     private var lastBusy: Date?
@@ -1281,8 +1292,9 @@ enum Ink {
     }
     static let paper = dyn(hex(0xF1ECE0), hex(0x201813))   // light: the film's own paper, so the print has no edge
     static let text = dyn(hex(0x3B2216), hex(0xF3E9DA))
-    static let soft = dyn(hex(0x3B2216, 0.62), hex(0xF3E9DA, 0.62))
+    static let soft = dyn(hex(0x3B2216, 0.70), hex(0xF3E9DA, 0.62))   // 4.9:1 on a light group, 5.8:1 on a dark one
     static let faint = dyn(hex(0x3B2216, 0.12), hex(0xF3E9DA, 0.12))
+    static let offTrack = dyn(hex(0x3B2216, 0.26), hex(0xF3E9DA, 0.18))   // an off switch still reads as a switch on paper
     static let hover = dyn(hex(0x3B2216, 0.06), hex(0xF3E9DA, 0.07))
     static let group = dyn(hex(0x3B2216, 0.045), hex(0xF3E9DA, 0.055))   // a settings group sits on the paper
 }
@@ -1334,7 +1346,7 @@ struct CardSwitch: ToggleStyle {
     func makeBody(configuration: Configuration) -> some View {
         let on = configuration.isOn
         return Capsule()
-            .fill(on ? Loaf.accent : Ink.faint)
+            .fill(on ? Loaf.accent : Ink.offTrack)
             .frame(width: 44, height: 20)
             .overlay(alignment: on ? .trailing : .leading) {   // the knob is a pill, as macOS draws it
                 Capsule().fill(Color.white).shadow(color: .black.opacity(0.22), radius: 1, y: 0.5).frame(width: 26, height: 16).padding(2)
@@ -1359,7 +1371,9 @@ struct SettingRow: View {
     }
 }
 
-/// One session keeping the Mac awake: its name on the left; what it is doing and for how long on the right.
+/// One session keeping the Mac awake: its name on the left; what it is doing and for how long on the right. The right
+/// side stays short so the name gets the room: "working" while a turn runs, "2 tasks running" once only its background
+/// tasks are left (the summary above carries the task total).
 struct HolderRow: View {
     let holder: Model.Holder, now: Date
     static func age(_ seconds: TimeInterval) -> String {
@@ -1367,10 +1381,7 @@ struct HolderRow: View {
         return m < 1 ? "<1m" : m < 60 ? "\(m)m" : "\(m / 60)h \(m % 60)m"
     }
     var doing: String {
-        var parts: [String] = []
-        if holder.working { parts.append("working") }
-        if holder.tasks > 0 { parts.append(holder.tasks == 1 ? "1 task" : "\(holder.tasks) tasks") }
-        return parts.joined(separator: ", ")
+        holder.working ? "working" : holder.tasks == 1 ? "1 task running" : "\(holder.tasks) tasks running"
     }
     var body: some View {
         HStack(spacing: 10) {
@@ -1494,6 +1505,20 @@ struct Panel: View {
                 .padding(.horizontal, 8).padding(.bottom, 8)
                 .transition(.opacity)
             }
+            // Without the sudo helper macOS sleeps a shut MacBook whatever Loaf asks, so say so before the user finds out.
+            if model.helperMissing {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Closing the lid will sleep the Mac").font(.system(size: 12, weight: .medium)).foregroundStyle(Ink.text)
+                    Text("To keep it awake shut, run this once in the folder Loaf was installed from:")
+                        .font(.system(size: 11)).foregroundStyle(Ink.soft).fixedSize(horizontal: false, vertical: true)
+                    Text("sudo ./install-sleep-helper.sh").font(.system(size: 11, design: .monospaced)).foregroundStyle(Ink.text)
+                        .textSelection(.enabled).padding(.top, 1)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9).frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Ink.group))
+                .padding(.horizontal, 8).padding(.bottom, 8)
+                .accessibilityElement(children: .combine)
+            }
             VStack(spacing: 0) {
                 SettingRow(label: "Chime when the lid closes", help: "Plays a short chime as the lid shuts", on: Binding(
                     get: { model.chimeOnClose },
@@ -1579,6 +1604,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.model.refresh()
         }
         watchBusyDir()
+        let lidded = hasLid()
+        model.hold.onAvailability = { [weak model] ok in model?.helperMissing = !ok && lidded }
         model.hold.probe()
         signal(SIGTERM, SIG_IGN)
         let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -1747,14 +1774,15 @@ if ProcessInfo.processInfo.environment["LOAF_FILMTEST"] != nil {
 // Off-screen snapshots for design review: LOAF_RENDER=<dir> Loaf
 if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
     MainActor.assumeIsolated {
-        for state in ["awake", "winding", "asleep", "allowed", "live"] { for dark in [false, true] {   // live: this Mac's real sessions
+        for state in ["awake", "winding", "asleep", "allowed", "nohelper", "live"] { for dark in [false, true] {   // live: this Mac's real sessions
             let m = Model()
-            m.awake = state == "awake" || state == "winding"
+            m.awake = state == "awake" || state == "winding" || state == "nohelper"
             m.allowSleep = state == "allowed"
+            m.helperMissing = state == "nohelper"   // no sudo helper: the card says the lid will still sleep the Mac
             // awake: more sessions than fit (long titles, a background-only one); allowed: two
             let now = Date(), names = ["Sync refactor", "Fix the flaky upload test", "Add dark mode to settings", "Full test suite",
                                        "Settings migration", "Profile cold start", "Release notes"]
-            let n = state == "awake" ? names.count : state == "allowed" ? 2 : 0
+            let n = state == "awake" ? names.count : state == "allowed" || state == "nohelper" ? 2 : 0
             var sessions: [String: Date] = [:], bg = Busy.Background()
             for i in 0..<n {
                 let id = "render-\(i)"; SessionNames.titles[id] = names[i]
@@ -1874,7 +1902,7 @@ if args.contains("--test-holders") {   // the card's rows from fixture folders: 
     let m = Model(), now = Date()
     m.scan = Busy.scan(now: now); m.background = Busy.scanBackground(now: now)
     let got = Set(m.holders(now: now).map { "\($0.name)|\(HolderRow(holder: $0, now: now).doing)" })
-    let want: Set = ["Say \"hi\"|working", "my-project|1 task", "Claude session|2 tasks"]
+    let want: Set = ["Say \"hi\"|working", "my-project|1 task running", "Claude session|2 tasks running"]
     print(got == want ? "PASS holders: app title, terminal folder, unknown session" : "FAIL holders: got \(got.sorted())")
     let ages = [30.0, 60, 3599, 3660].map { HolderRow.age($0) }
     print(ages == ["<1m", "1m", "59m", "1h 1m"] ? "PASS ages" : "FAIL ages: \(ages)")
