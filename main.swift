@@ -195,6 +195,11 @@ enum Alerts {
             }
         }
     }
+    /// System Settings, Notifications, open on Loaf's own page.
+    static func openSettings() {
+        let id = Bundle.main.bundleIdentifier ?? ""
+        if let u = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(id)") { NSWorkspace.shared.open(u) }
+    }
     /// Whether macOS will show Loaf's notifications: "allowed", "off" (turned off in System Settings, or the first
     /// prompt went unanswered) or "not asked". Reading it never prompts.
     static func status(_ done: @escaping (String) -> Void) {
@@ -1037,6 +1042,11 @@ final class Model: ObservableObject {
     let hold = SleepHold()
     /// The launch probe found no working sleep helper, so closing the lid will still sleep the Mac.
     @Published var helperMissing = false
+    /// macOS will not show Loaf's notifications (turned off, or the first prompt went unanswered) and won't ask again.
+    @Published var notificationsOff = false
+    func readNotifications() {
+        Alerts.status { s in DispatchQueue.main.async { [weak self] in self?.notificationsOff = s == "off" } }
+    }
     var onChange: (() -> Void)?
     var lastChime = Date.distantPast
     private var lastBusy: Date?
@@ -1341,6 +1351,7 @@ enum Ink {
     static let text = dyn(hex(0x3B2216), hex(0xF3E9DA))
     static let soft = dyn(hex(0x3B2216, 0.70), hex(0xF3E9DA, 0.62))   // 4.9:1 on a light group, 5.8:1 on a dark one
     static let faint = dyn(hex(0x3B2216, 0.12), hex(0xF3E9DA, 0.12))
+    static let link = dyn(hex(0x9E4513), hex(0xF07D3D))   // the accent as small text: 4.9:1 on a light group, 5.6:1 on a dark one
     static let offTrack = dyn(hex(0x3B2216, 0.26), hex(0xF3E9DA, 0.18))   // an off switch still reads as a switch on paper
     static let hover = dyn(hex(0x3B2216, 0.06), hex(0xF3E9DA, 0.07))
     static let group = dyn(hex(0x3B2216, 0.045), hex(0xF3E9DA, 0.055))   // a settings group sits on the paper
@@ -1566,6 +1577,19 @@ struct Panel: View {
                 .padding(.horizontal, 8).padding(.bottom, 8)
                 .accessibilityElement(children: .combine)
             }
+            // On battery with notifications off, the low-battery alerts can't show on screen, and macOS never asks twice.
+            if model.notificationsOff, model.battery?.onBattery == true {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Notifications are off for Loaf").font(.system(size: 12, weight: .medium)).foregroundStyle(Ink.text)
+                    Text("Low-battery alerts won't show on screen.").font(.system(size: 11)).foregroundStyle(Ink.soft)
+                    Button("Open Notification Settings") { Alerts.openSettings() }
+                        .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(Ink.link).padding(.top, 2)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9).frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Ink.group))
+                .padding(.horizontal, 8).padding(.bottom, 8)
+                .transition(.opacity)
+            }
             VStack(spacing: 0) {
                 SettingRow(label: "Chime when the lid closes", help: "Plays a short chime as the lid shuts", on: Binding(
                     get: { model.chimeOnClose },
@@ -1662,6 +1686,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Alerts.enabled = true
         EventLog.write("Loaf started, Lid chime \(model.chimeOnClose ? "on" : "off")")
         Alerts.status { EventLog.write("notifications \($0)\($0 == "off" ? ": battery alerts reach only the alert command until Loaf is allowed in System Settings, Notifications" : "")") }
+        model.readNotifications()
     }
 
     /// Make the busy folder, and refresh the moment a session file appears or goes (touching an existing one is caught by the 5 s tick).
@@ -1706,6 +1731,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.refresh()
         model.refreshAppHolds()
         Alerts.askIfNew()
+        model.readNotifications()
         if host.superview == nil { card.contentView?.addSubview(host) }
         place()
         let end = card.frame
@@ -1823,15 +1849,16 @@ if ProcessInfo.processInfo.environment["LOAF_FILMTEST"] != nil {
 // Off-screen snapshots for design review: LOAF_RENDER=<dir> Loaf
 if let dir = ProcessInfo.processInfo.environment["LOAF_RENDER"] {
     MainActor.assumeIsolated {
-        for state in ["awake", "winding", "asleep", "allowed", "nohelper", "live"] { for dark in [false, true] {   // live: this Mac's real sessions
+        for state in ["awake", "winding", "asleep", "allowed", "nohelper", "nonotify", "live"] { for dark in [false, true] {   // live: this Mac's real sessions
             let m = Model()
-            m.awake = state == "awake" || state == "winding" || state == "nohelper"
+            m.awake = ["awake", "winding", "nohelper", "nonotify"].contains(state)
             m.allowSleep = state == "allowed"
             m.helperMissing = state == "nohelper"   // no sudo helper: the card says the lid will still sleep the Mac
+            if state == "nonotify" { m.notificationsOff = true; m.battery = .init(percent: 34, onBattery: true) }   // on battery, alerts off
             // awake: more sessions than fit (long titles, a background-only one); allowed: two
             let now = Date(), names = ["Sync refactor", "Fix the flaky upload test", "Add dark mode to settings", "Full test suite",
                                        "Settings migration", "Profile cold start", "Release notes"]
-            let n = state == "awake" ? names.count : state == "allowed" || state == "nohelper" ? 2 : 0
+            let n = state == "awake" ? names.count : ["allowed", "nohelper", "nonotify"].contains(state) ? 2 : 0
             var sessions: [String: Date] = [:], bg = Busy.Background()
             for i in 0..<n {
                 let id = "render-\(i)"; SessionNames.titles[id] = names[i]
