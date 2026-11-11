@@ -1113,8 +1113,10 @@ final class Model: ObservableObject {
         if rows != appHolds { appHolds = rows }
     }
 
+    /// Tests replace the battery reading, so a check never sends a real alert.
+    var readBattery = SleepHold.battery
     private func checkBattery() {
-        let b = SleepHold.battery().map { Battery(percent: $0.percent, onBattery: $0.onBattery) }
+        let b = readBattery().map { Battery(percent: $0.percent, onBattery: $0.onBattery) }
         if b != battery { battery = b }
         guard let b else { return }
         let (alert, sent) = BatteryAlert.next(percent: b.percent, onBattery: b.onBattery, sent: batterySent)
@@ -1122,17 +1124,38 @@ final class Model: ObservableObject {
         if let alert { Alerts.post(BatteryAlert.words(alert)); EventLog.write("battery at \(b.percent)% on battery: \(alert)% alert sent") }
     }
 
+    private static let scanQueue = DispatchQueue(label: "loaf.background-scan", qos: .utility)
+    private var backgroundScanning = false
+    private func takeBackground(_ b: Busy.Background) {
+        // only when background work starts or stops (or a scan is slow): the count moves almost every minute and buried
+        // the lid and hold events
+        if (b.total > 0) != (background.total > 0) || b.millis > 250 { EventLog.write("background tasks: \(b.recent) written to recently, \(b.open) held open (\(String(format: "%.0f", b.millis)) ms)") }
+        background = b
+    }
+
     func refresh(now: Date = Date()) {
         checkBattery()
         let scan = Busy.scan(now: now)
         if scan != self.scan { self.scan = scan }
-        if now.timeIntervalSince(lastBackground) >= 60 || now < lastBackground {   // about once a minute
+        if !backgroundScanning && (now.timeIntervalSince(lastBackground) >= 60 || now < lastBackground) {   // about once a minute
+            // The scan stats every task output and lists open files, which takes a few hundred ms on a loaded Mac; on the
+            // main thread that froze the card and the lid-angle poll that starts the chime. Launch scans inline, so the
+            // first decision already counts background work; after that it runs on its own queue and refreshes when done.
+            let first = lastBackground == .distantPast
             lastBackground = now
-            let b = Busy.scanBackground(now: now)
-            // only when background work starts or stops (or a scan is slow): the count moves almost every minute and buried
-            // the lid and hold events
-            if (b.total > 0) != (background.total > 0) || b.millis > 250 { EventLog.write("background tasks: \(b.recent) written to recently, \(b.open) held open (\(String(format: "%.0f", b.millis)) ms)") }
-            background = b
+            if first { takeBackground(Busy.scanBackground(now: now)) }
+            else {
+                backgroundScanning = true
+                Self.scanQueue.async {
+                    let b = Busy.scanBackground(now: now)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.backgroundScanning = false
+                        self.takeBackground(b)
+                        self.refresh()
+                    }
+                }
+            }
         }
         let total = scan.total + background.total
         if total > 0 { lastBusy = now }
@@ -1930,9 +1953,19 @@ if args.contains("--test-holders") {   // the card's rows from fixture folders: 
     let got = Set(m.holders(now: now).map { "\($0.name)|\(HolderRow(holder: $0, now: now).doing)" })
     let want: Set = ["Say \"hi\"|working", "my-project|1 task running", "Claude session|2 tasks running"]
     print(got == want ? "PASS holders: app title, terminal folder, unknown session" : "FAIL holders: got \(got.sorted())")
+    // the minute's background scan runs off the main thread: refresh returns before it lands, and it lands soon after
+    let bm = Model(); bm.readBattery = { nil }
+    bm.refresh(now: now)                                                               // launch: scanned inline
+    let atLaunch = bm.background.total
+    put(root + "/tmp/-x/s-new/tasks/d.output", "")
+    bm.refresh(now: now.addingTimeInterval(61))
+    let rightAfter = bm.background.total
+    RunLoop.main.run(until: Date().addingTimeInterval(1))
+    let offMain = atLaunch == 3 && rightAfter == 3 && bm.background.total == 4
+    print(offMain ? "PASS background scan: inline at launch, then off the main thread" : "FAIL background scan: \(atLaunch), \(rightAfter), \(bm.background.total)")
     let ages = [30.0, 60, 3599, 3660].map { HolderRow.age($0) }
     print(ages == ["<1m", "1m", "59m", "1h 1m"] ? "PASS ages" : "FAIL ages: \(ages)")
-    exit(got == want && ages == ["<1m", "1m", "59m", "1h 1m"] ? 0 : 1)
+    exit(got == want && offMain && ages == ["<1m", "1m", "59m", "1h 1m"] ? 0 : 1)
 }
 if args.contains("--test-interrupt") {   // a stopped turn stops counting at once (no Stop hook runs on an interrupt)
     let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent("loaf-interrupt-\(getpid())").path
