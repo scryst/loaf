@@ -92,10 +92,15 @@ func currentHolders() -> [String] {
 enum IdleSleep {
     /// `keepAwake` includes working agents and their grace period. Manual sleep overrides both.
     static func shouldSleep(idleSeconds: Double, sleepMinutes: Int, keepAwake: Bool, allowSleep: Bool,
-                            secondsSinceWake: Double, holders: [String]) -> Bool {
+                            secondsSinceWake: Double, holders: [String], inUse: Bool = false) -> Bool {
         sleepMinutes > 0 && idleSeconds > Double(sleepMinutes) * 60 &&
-            (!keepAwake || allowSleep) && secondsSinceWake >= 120 && !holders.isEmpty
+            (!keepAwake || allowSleep) && secondsSinceWake >= 120 && !holders.isEmpty && !inUse
     }
+
+    /// True when an app the person is using holds the screen or the Mac awake on purpose (a movie, a call, `caffeinate`,
+    /// music): macOS itself would stay up, so Loaf must not sleep it. The card's "Other apps" rule decides what counts, so
+    /// Claude's own hold, macOS bookkeeping, Discord's leftover locks and daemons with no app never block the sleep.
+    static func inUse(_ holds: [PowerHold]) -> Bool { !PowerHolds.rows(holds).isEmpty || !PowerHolds.screenBlockers(holds).isEmpty }
 
     static func idleSeconds() -> Double? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
@@ -592,6 +597,7 @@ final class SleepHold {
     private var wanted = false
     private var pending = 0
     private var lastReassert = Date.distantPast
+    private var lastProbe = Date()
     private let queue = DispatchQueue(label: "loaf.sleephold")
     /// Tests replace the safety-floor reading, the lid, the display check and the sleep call.
     var floorProbe: ((Bool) -> String?)?
@@ -685,7 +691,12 @@ final class SleepHold {
     /// Called whenever keep-awake may have changed, and every few seconds (that is the safety-floor check).
     func sync(awake: Bool) {
         wanted = awake
-        guard available else { return }
+        if !available {   // a failed set must not turn the lid hold off for the whole run: probe again every 5 minutes
+            guard pending == 0, Date().timeIntervalSince(lastProbe) > 300 else { return }
+            lastProbe = Date()
+            probe()
+            return
+        }
         let floorCheck = floorProbe ?? { Self.floorReason(tripped: $0) }
         if awake, let why = floorCheck(floor != nil) {
             if floor != why { EventLog.write("safety floor: \(why); releasing the sleep hold until it clears"); floor = why }
@@ -697,6 +708,9 @@ final class SleepHold {
         else if held, pending == 0, !Self.sleepDisabled, Date().timeIntervalSince(lastReassert) > 60 {
             lastReassert = Date()
             set(true, why: "re-asserting (SleepDisabled was cleared elsewhere)", force: true)
+        } else if !held, pending == 0, Self.sleepDisabled, Date().timeIntervalSince(lastReassert) > 60 {
+            lastReassert = Date()   // a release that failed three times: try again instead of leaving the lid hold stuck
+            set(false, why: "retrying a release that failed (SleepDisabled is still on)", force: true)
         }
     }
 
@@ -714,7 +728,7 @@ final class SleepHold {
                 EventLog.write(String(format: "sleep hold %@ (%@): disablesleep %d rc=%d SleepDisabled=%@ (%.0f ms)", on ? "SET" : "RELEASED", why,
                                       on ? 1 : 0, rc, Self.sleepDisabled ? "yes" : "no", Date().timeIntervalSince(t0) * 1000))
                 if rc != 0 && on { self.available = false; self.held = false }
-                if rc != 0 && !on { EventLog.write("WARNING: could not release disablesleep; the watchdog and the next launch will retry") }
+                if rc != 0 && !on { EventLog.write("WARNING: could not release disablesleep; Loaf retries every minute, and the next launch resets it") }
                 if thenSleep && !on && !self.held { self.releasedWithLidShut(why) }   // not if a new hold was set meanwhile
             }
         }
@@ -1098,7 +1112,8 @@ final class Model: ObservableObject {
         let holders = currentHolders()
         guard let idle = IdleSleep.idleSeconds(),
               IdleSleep.shouldSleep(idleSeconds: idle, sleepMinutes: minutes, keepAwake: keepAwake, allowSleep: allowSleep,
-                                    secondsSinceWake: now.timeIntervalSince(lastWake), holders: holders) else { return }
+                                    secondsSinceWake: now.timeIntervalSince(lastWake), holders: holders,
+                                    inUse: IdleSleep.inUse(PowerHolds.live())) else { return }
         EventLog.write("idle \(Int(idle / 60))m with \(awake ? "agents held off by the safety floor (\(hold.floor ?? ""))" : "no agents"); app holds \(holders.joined(separator: ", ")) ignored: sleeping the Mac now")
         SleepHold.pmsetSleepNow()
     }
@@ -1923,9 +1938,9 @@ func spin(_ s: Double) { RunLoop.main.run(until: Date().addingTimeInterval(s)) }
 if args.contains("--test-idle-sleep") {
     var failures = 0
     func check(_ name: String, idle: Double = 601, minutes: Int = 10, awake: Bool = false,
-               allowed: Bool = false, sinceWake: Double = 300, holders: [String] = ["Claude", "Spotify"], expected: Bool) {
+               allowed: Bool = false, sinceWake: Double = 300, holders: [String] = ["Claude", "Spotify"], inUse: Bool = false, expected: Bool) {
         let actual = IdleSleep.shouldSleep(idleSeconds: idle, sleepMinutes: minutes, keepAwake: awake,
-                                          allowSleep: allowed, secondsSinceWake: sinceWake, holders: holders)
+                                          allowSleep: allowed, secondsSinceWake: sinceWake, holders: holders, inUse: inUse)
         let pass = actual == expected
         print("\(pass ? "PASS" : "FAIL") \(name): sleep=\(actual)")
         if !pass { failures += 1 }
@@ -1944,6 +1959,19 @@ if args.contains("--test-idle-sleep") {
     check("exact idle threshold", idle: 600, expected: false)
     check("idle with app assertions", expected: true)
     check("no other holders", holders: [], expected: false)
+    check("app in use blocks the sleep", inUse: true, expected: false)
+    // what counts as "in use", from real `pmset -g assertions` lines
+    func holds(_ lines: String) -> [PowerHold] { PowerHolds.parse("Listed by owning process:\n" + lines) }
+    let video = holds("   pid 410(Google Chrome): [0x0001] 00:10:00 NoDisplaySleepAssertion named: \"Video Playing\"\n")
+    let discordOnly = holds("   pid 41425(Discord): [0x0002] 02:35:52 NoDisplaySleepAssertion named: \"Video Wake Lock\"\n")
+    let claudeOnly = holds("   pid 600(Claude): [0x0003] 01:00:00 PreventUserIdleSystemSleep named: \"Electron\"\n")
+    let powerdOnly = holds("   pid 77(powerd): [0x0004] 01:00:00 NoDisplaySleepAssertion named: \"Display is on\"\n")
+    for (name, h, expected) in [("movie (display hold)", video, true), ("Discord leftover lock", discordOnly, false),
+                                ("Claude's own hold", claudeOnly, false), ("macOS bookkeeping", powerdOnly, false), ("no holds", [], false)] {
+        let actual = IdleSleep.inUse(h)
+        print("\(actual == expected ? "PASS" : "FAIL") in use, \(name): \(actual)")
+        if actual != expected { failures += 1 }
+    }
     for (settings, expected) in [(" sleep 1 (sleep prevented by Claude)\n", 1),
                                   ("displaysleep 10\n sleep 0\n", 0), ("sleep never", nil), ("displaysleep 10", nil),
                                   (" displaysleep 10\n sleep 1 (sleep prevented by powerd)\n", 10),

@@ -16,6 +16,8 @@ bin="$tmp/Loaf.app/Contents/MacOS/Loaf"
 "$bin" --scan-bg | sed 's/^/ok: scan-bg /'
 "$bin" --test-holders
 "$bin" --test-interrupt
+"$bin" --test-idle-sleep | grep -c PASS | sed 's/^/ok: idle-sleep passes: /'
+"$bin" --test-idle-sleep | grep -q FAIL && { echo "FAIL: idle-sleep"; exit 1; } || true
 "$bin" --test-power
 "$bin" --holders | tail -1 | sed 's/^/ok: live holders /'
 "$bin" --notify-status | sed 's/^/ok: /'

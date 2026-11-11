@@ -9,6 +9,11 @@ labels=(app.loaf.Loaf app.loaf.Loaf.watchdog)
 
 # build first: build.sh swaps the bundle in only after swiftc succeeds, so a failed build leaves the running Loaf up
 ./build.sh
+# and the hooks next, still before anything is stopped: a bad settings.json aborts here with Loaf and its watchdog up
+# the busy-signal hook lives outside the app bundle so a rebuild never leaves Claude Code pointing at a missing file
+mkdir -p "$HOME/Library/Application Support/Loaf/busy"
+cp loaf-busy-hook.sh "$HOME/Library/Application Support/Loaf/loaf-busy-hook.sh"
+./install-hooks.py
 # then stop the current Loaf and watchdog by label so the new bundle starts under launchd. bootout returns before launchd
 # has let go of the job, and bootstrapping too soon fails with "5: Input/output error", so
 # wait up to 5 s for each label to be gone.
@@ -19,10 +24,6 @@ for l in $labels; do
   fi
 done
 
-# the busy-signal hook lives outside the app bundle so a rebuild never leaves Claude Code pointing at a missing file
-mkdir -p "$HOME/Library/Application Support/Loaf/busy"
-cp loaf-busy-hook.sh "$HOME/Library/Application Support/Loaf/loaf-busy-hook.sh"
-./install-hooks.py
 for l in $labels; do
   sed "s|__HOME__|$HOME|" $l.plist > $agents/$l.plist
   # and retry the bootstrap for up to 5 s in case launchd is still busy with the old job; the last try's error stands
