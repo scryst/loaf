@@ -18,4 +18,5 @@ bin="$tmp/Loaf.app/Contents/MacOS/Loaf"
 "$bin" --test-interrupt
 "$bin" --test-power
 "$bin" --holders | tail -1 | sed 's/^/ok: live holders /'
+"$bin" --notify-status | sed 's/^/ok: /'
 echo "all checks passed"

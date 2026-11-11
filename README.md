@@ -36,7 +36,7 @@ Below your sessions the card lists anything else holding the Mac or the screen a
 
 ## On battery
 
-The card shows the charge, and a notification comes at 20% and again at 10%. At 10% Loaf stops counting your agents as a reason to stay up, so an idle Mac can sleep before it runs flat, and it starts again once the charge is back above 14% or the Mac is plugged in. To hear about it on your phone as well, point `alertCommand` at any program that takes a title and a message:
+The card shows the charge, and a notification comes at 20% and again at 10%. Loaf asks to send them the first time you open the card; if none ever comes, check that Loaf is allowed under Notifications in System Settings. At 10% Loaf stops counting your agents as a reason to stay up, so an idle Mac can sleep before it runs flat, and it starts again once the charge is back above 14% or the Mac is plugged in. To hear about it on your phone as well, point `alertCommand` at any program that takes a title and a message:
 
 ```bash
 defaults write app.loaf.Loaf alertCommand -array /path/to/your/notifier

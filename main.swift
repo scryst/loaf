@@ -183,6 +183,30 @@ enum Alerts {
         if enabled { p.terminationHandler = { EventLog.write("alert command exited \($0.terminationStatus)") } }   // not from the checks
         do { try p.run(); return p } catch { EventLog.write("alert command failed to run: \(error)"); return nil }
     }
+    /// Ask to show notifications when the card is opened, while someone is there to answer. Left to the first alert,
+    /// macOS asks at 20% battery, often with nobody at the Mac; an unanswered prompt leaves notifications off and
+    /// macOS never asks again.
+    static func askIfNew() {
+        guard enabled else { return }
+        status { s in
+            guard s == "not asked" else { return }
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                EventLog.write("notifications \(granted ? "allowed" : "not allowed") at the first ask")
+            }
+        }
+    }
+    /// Whether macOS will show Loaf's notifications: "allowed", "off" (turned off in System Settings, or the first
+    /// prompt went unanswered) or "not asked". Reading it never prompts.
+    static func status(_ done: @escaping (String) -> Void) {
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            switch s.authorizationStatus {
+            case .authorized, .provisional: done("allowed")
+            case .denied: done("off")
+            case .notDetermined: done("not asked")
+            @unknown default: done("unknown")
+            }
+        }
+    }
 }
 
 // MARK: - What is holding the screen and the Mac awake, as `pmset -g assertions` lists it by owning process
@@ -1614,6 +1638,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         termSource = term
         Alerts.enabled = true
         EventLog.write("Loaf started, Lid chime \(model.chimeOnClose ? "on" : "off")")
+        Alerts.status { EventLog.write("notifications \($0)\($0 == "off" ? ": battery alerts reach only the alert command until Loaf is allowed in System Settings, Notifications" : "")") }
     }
 
     /// Make the busy folder, and refresh the moment a session file appears or goes (touching an existing one is caught by the 5 s tick).
@@ -1657,6 +1682,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if card.isVisible || Date().timeIntervalSince(closedAt) < 0.3 { close(); return }
         model.refresh()
         model.refreshAppHolds()
+        Alerts.askIfNew()
         if host.superview == nil { card.contentView?.addSubview(host) }
         place()
         let end = card.frame
@@ -2014,6 +2040,10 @@ if args.contains("--power") {   // prints the live holds as the card lists them,
           "would turn off now: \(m.screenOffWhenIdle && ScreenIdle.shouldTurnOff(idleSeconds: idle, minutes: m.screenOffMinutes, screenAsleep: ScreenIdle.screenAsleep, holds: holds))")
     if let b = SleepHold.battery() { print("battery \(b.percent)% \(b.onBattery ? "on battery" : "on power")") }
     exit(0)
+}
+if args.contains("--notify-status") {   // whether macOS will show Loaf's notifications; reading it never prompts
+    Alerts.status { print("notifications: \($0)"); exit(0) }
+    spin(5); print("notifications: no answer from macOS"); exit(1)
 }
 if args.contains("--holders") {   // prints the card's "keeping it awake" rows from the live scans; never touches the sleep hold
     let m = Model(), now = Date(), t0 = CACurrentMediaTime()
